@@ -1,0 +1,9 @@
+.env
+node_modules/
+npm-debug.log*
+update_pass.sql
+update_admin_pass.sql
+server.js.backup
+backup_*.sql
+temp_migration.sql
+desktop.ini
