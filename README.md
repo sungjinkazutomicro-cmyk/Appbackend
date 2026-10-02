@@ -9,6 +9,7 @@ Node + Express + MySQL. Start with `npm install` then `npm start`.
    `DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME JWT_SECRET FACEPP_API_KEY FACEPP_API_SECRET`
    - `JWT_SECRET` must be 32+ random characters and kept private:
      `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+   - `PHOTO_ENCRYPTION_KEY`: 64 random hex characters (same generator command). Encrypts ID photos waiting for review. Set it BEFORE the first sign-up and never change it afterwards, or old photos can't be shown.
    - Optional: `CORS_ORIGIN`, `DB_SSL=true` (if the DB is on another network), `KEEP_ID_PHOTOS=true`.
 4. Create the first admin: `node create-admin.js <username> <password> <4-digit-pin>`
 5. Point the Flutter app's `apiBase` (and the admin panel) at `https://<your-domain>/api`.

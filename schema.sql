@@ -178,6 +178,20 @@ CREATE TABLE IF NOT EXISTS loan_approvals (
   FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+-- ---------- admin audit log (who did what) ----------
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  admin_id INT NULL,
+  action VARCHAR(50) NOT NULL,
+  target_type VARCHAR(30) NOT NULL,
+  target_id VARCHAR(64) NOT NULL,
+  details JSON NULL,
+  ip VARCHAR(64) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_audit_admin (admin_id, created_at),
+  KEY idx_audit_target (target_type, target_id)
+) ENGINE=InnoDB;
+
 -- ---------- login lockouts (survive server restarts) ----------
 CREATE TABLE IF NOT EXISTS login_attempts (
   id INT AUTO_INCREMENT PRIMARY KEY,
