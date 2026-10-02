@@ -391,6 +391,70 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// ---------- extra hardening helpers ----------
+// Per-user cap on money actions, so one login can't hammer send/pay/load/bills
+// (or guess which numbers are registered through "recipient not found").
+const moneyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.userId ? `u:${req.userId}` : ipKeyGenerator(req)),
+  message: { error: 'Too many payments in a short time. Please wait a minute and try again.' },
+});
+
+// Records what each admin did. Best effort: a logging problem never blocks the action.
+async function logAdmin(req, action, targetType, targetId, details) {
+  try {
+    await pool.execute(
+      'INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, details, ip) VALUES (?,?,?,?,?,?)',
+      [req.adminId, action, targetType, String(targetId ?? ''), details ? JSON.stringify(details) : null, (req.ip || '').toString().slice(0, 64)]
+    );
+  } catch (err) {
+    console.error('Audit log write failed:', err.message);
+  }
+}
+
+// ID photos waiting for review are encrypted in the database (AES-256-GCM).
+// Set PHOTO_ENCRYPTION_KEY to 64 hex characters:
+//   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+// Without the key, photos are stored as before. Set it before the first sign-up.
+const PHOTO_KEY = /^[0-9a-f]{64}$/i.test(process.env.PHOTO_ENCRYPTION_KEY || '')
+  ? Buffer.from(process.env.PHOTO_ENCRYPTION_KEY, 'hex')
+  : null;
+if (!PHOTO_KEY) console.warn('WARNING: PHOTO_ENCRYPTION_KEY is not set - ID photos are stored unencrypted.');
+
+function encryptPhoto(text) {
+  if (!PHOTO_KEY || !text) return text;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', PHOTO_KEY, iv);
+  const enc = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  return 'enc:v1:' + Buffer.concat([iv, cipher.getAuthTag(), enc]).toString('base64');
+}
+
+function decryptPhoto(text) {
+  if (typeof text !== 'string' || !text.startsWith('enc:v1:')) return text;
+  if (!PHOTO_KEY) return '';
+  try {
+    const raw = Buffer.from(text.slice(7), 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', PHOTO_KEY, raw.subarray(0, 12));
+    decipher.setAuthTag(raw.subarray(12, 28));
+    return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+// Free text that admins will read (group names, reasons, loan purpose...):
+// trimmed, length-capped, and stripped of < > and control characters so it
+// can't carry HTML/script into the admin panel.
+function cleanText(value, max) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f<>]/g, '')
+    .trim()
+    .slice(0, max);
+}
+
 // Money actions (send, QR pay, load, bill pay) need the PIN again, so a stolen
 // login token alone can't drain a wallet. Uses the same persistent lockout
 // counter as the login PIN step, so guessing is throttled the same way.
@@ -763,7 +827,7 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)`,
       [
         username, passwordHash, pinHash, walletId, 0, phoneNumber,
-        normalizedId, governmentIdPhotoFrontBase64, governmentIdPhotoBackBase64, selfiePhotoBase64,
+        normalizedId, encryptPhoto(governmentIdPhotoFrontBase64), encryptPhoto(governmentIdPhotoBackBase64), encryptPhoto(selfiePhotoBase64),
         verificationStatus, confidence,
       ]
     );
@@ -901,7 +965,7 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
 
 // ---------- wallet-to-wallet (QR) payment ----------
 
-app.post('/api/wallet/pay', requireAuth, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/wallet/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
   const { walletId, amountCentavos } = req.body || {};
   const amt = parseCentavos(amountCentavos);
   if (!walletId || amt === null) {
@@ -971,7 +1035,7 @@ app.post('/api/wallet/pay', requireAuth, requirePin, asyncRoute(async (req, res)
 
 // Lets the app check a PIN in its confirm dialog (and show "Incorrect PIN")
 // before starting a payment. The payment routes still verify the PIN themselves.
-app.post('/api/pin/check', requireAuth, requirePin, (req, res) => res.json({ ok: true }));
+app.post('/api/pin/check', requireAuth, moneyLimiter, requirePin, (req, res) => res.json({ ok: true }));
 
 app.get('/api/notifications', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
@@ -985,7 +1049,7 @@ app.get('/api/notifications', requireAuth, asyncRoute(async (req, res) => {
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
 }));
 
-app.post('/api/send', requireAuth, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/send', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
   const recipient = req.body?.recipient?.toString().trim();
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!recipient || amt === null) {
@@ -1051,7 +1115,7 @@ app.post('/api/send', requireAuth, requirePin, asyncRoute(async (req, res) => {
   }
 }));
 
-app.post('/api/load', requireAuth, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/load', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
   const { number, network } = req.body || {};
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!number || !network || amt === null) {
@@ -1089,7 +1153,7 @@ app.post('/api/load', requireAuth, requirePin, asyncRoute(async (req, res) => {
   }
 }));
 
-app.post('/api/bills/pay', requireAuth, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/bills/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
   const biller = req.body?.biller?.toString().trim();
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!biller || amt === null) {
@@ -1258,7 +1322,7 @@ app.get('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => 
 app.post('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
-  const reason = req.body?.reason?.toString().trim() || null;
+  const reason = cleanText(req.body?.reason, 255) || null;
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
 
   const conn = await pool.getConnection();
@@ -1322,7 +1386,7 @@ app.get('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req,
 // ---------- groups (capped at MAX_GROUP_MEMBERS) ----------
 
 app.post('/api/groups', requireAuth, asyncRoute(async (req, res) => {
-  const { name } = req.body || {};
+  const name = cleanText(req.body?.name, 100);
   if (!name) return res.status(400).json({ error: 'name is required' });
 
   const conn = await pool.getConnection();
@@ -1592,7 +1656,7 @@ app.post('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) =>
 // ---------- savings goals (personal, locked sub-balance) ----------
 
 app.post('/api/savings', requireAuth, asyncRoute(async (req, res) => {
-  const name = req.body?.name?.toString().trim();
+  const name = cleanText(req.body?.name, 100);
   const target = parseCentavos(req.body?.targetAmountCentavos);
   if (!name) return res.status(400).json({ error: 'A goal name is required' });
   if (target === null) return res.status(400).json({ error: 'A positive target amount (integer centavos) is required' });
@@ -1861,6 +1925,7 @@ app.post('/api/admin/users/:id/status', requireAdmin, asyncRoute(async (req, res
   }
 
   await refreshUserInIndex(userId);
+  await logAdmin(req, suspend ? 'suspend_user' : 'unsuspend_user', 'user', userId);
   res.json({ ok: true, status: suspend ? 'suspended' : 'active' });
 }));
 
@@ -1951,6 +2016,7 @@ app.delete('/api/admin/groups/:id/members/:userId', requireAdmin, asyncRoute(asy
     userId,
   ]);
   if (result.affectedRows === 0) return res.status(404).json({ error: 'That user is not in this group' });
+  await logAdmin(req, 'remove_group_member', 'group', groupId, { userId });
   res.json({ ok: true });
 }));
 
@@ -2000,6 +2066,7 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
     );
 
     await conn.commit();
+    await logAdmin(req, approve ? 'approve_group_withdrawal' : 'decline_group_withdrawal', 'withdrawal_request', reqId);
     res.json({ ok: true, status: approve ? 'approved' : 'declined' });
   } catch (err) {
     await conn.rollback();
@@ -2103,6 +2170,7 @@ app.post('/api/admin/transfers/:transferRef/reverse', requireAdmin, asyncRoute(a
     }
     await conn.commit();
     await Promise.all([...result.affectedUserIds].map(refreshUserInIndex));
+    await logAdmin(req, 'reverse_transfer', 'transfer', transferRef, { reversalTransferRef: result.reversalTransferRef });
     res.json({ ok: true, transferRef, reversalTransferRef: result.reversalTransferRef });
   } catch (err) {
     await conn.rollback();
@@ -2113,7 +2181,7 @@ app.post('/api/admin/transfers/:transferRef/reverse', requireAdmin, asyncRoute(a
 }));
 const UNDO_WINDOW_MS = 60 * 1000;
 
-app.post('/api/undo', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/undo', requireAuth, moneyLimiter, asyncRoute(async (req, res) => {
   const stack = getUndoStack(req.userId);
   if (stack.isEmpty()) {
     return res.status(400).json({ error: 'Nothing to undo' });
@@ -2233,9 +2301,9 @@ app.post('/api/loans', requireAuth, asyncRoute(async (req, res) => {
      VALUES (?,?,?,?,?,?,?,?,?)`,
     [
       req.userId,
-      loanType.toString().trim(),
+      cleanText(loanType, 50),
       amt,
-      purpose.toString().trim(),
+      cleanText(purpose, 255),
       term,
       applicantAge,
       governmentId.toString().trim(),
@@ -2405,6 +2473,7 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, re
       await conn.execute("UPDATE loans SET status = 'declined', decided_at = NOW() WHERE id = ?", [loanId]);
       await conn.commit();
       loanQueue.remove(loanId); // finalized — remove wherever it sits in the queue, not just the front
+      await logAdmin(req, 'decline_loan', 'loan', loanId);
       return res.json({ ok: true, status: 'declined' });
     }
 
@@ -2434,12 +2503,14 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, re
       await refreshUserInIndex(loan.user_id);
       loanQueue.remove(loanId); // finalized — remove wherever it sits in the queue, not just the front
 
+      await logAdmin(req, 'approve_loan', 'loan', loanId, { amount: loan.amount });
       return res.json({ ok: true, status: 'approved' });
     }
 
     // Still needs more admin approvals — stays in the queue, since it's
     // not finalized yet.
     await conn.commit();
+    await logAdmin(req, 'vote_approve_loan', 'loan', loanId, { approvals });
     res.json({ ok: true, status: 'pending', approvalsCount: approvals, approvalsNeeded: loan.approvals_needed });
   } catch (err) {
     await conn.rollback();
@@ -2539,7 +2610,14 @@ app.get('/api/admin/verifications/pending', requireAdmin, asyncRoute(async (req,
      WHERE verification_status = 'pending'
      ORDER BY created_at ASC`
   );
-  res.json(rows);
+  res.json(
+    rows.map((r) => ({
+      ...r,
+      governmentIdPhotoFront: decryptPhoto(r.governmentIdPhotoFront),
+      governmentIdPhotoBack: decryptPhoto(r.governmentIdPhotoBack),
+      selfiePhoto: decryptPhoto(r.selfiePhoto),
+    }))
+  );
 }));
 
 app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async (req, res) => {
@@ -2569,6 +2647,7 @@ app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async 
   }
 
   await refreshUserInIndex(userId);
+  await logAdmin(req, approve ? 'approve_verification' : 'reject_verification', 'user', userId);
   res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
 }));
 
